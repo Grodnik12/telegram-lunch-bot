@@ -1,9 +1,8 @@
 import asyncio
 import logging
-from aiogram import Bot, Dispatcher, F
-from aiogram.types import Message, CallbackQuery
-from aiogram.filters import Command
-from aiogram.utils.keyboard import InlineKeyboardBuilder
+from aiogram import Bot, Dispatcher, types
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.utils import executor
 import asyncpg
 from openpyxl import Workbook
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -20,7 +19,7 @@ ADMIN_IDS = list(map(int, os.getenv("ADMIN_IDS", "").split(",")))
 logging.basicConfig(level=logging.INFO)
 
 bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher()
+dp = Dispatcher(bot)
 
 
 # ---------------------- БАЗА ДАННЫХ ----------------------
@@ -65,25 +64,23 @@ async def init_db():
 # ---------------------- КНОПКИ ----------------------
 
 def admin_keyboard():
-    kb = InlineKeyboardBuilder()
-    kb.button(text="➕ Добавить меню", callback_data="add_menu")
-    kb.button(text="📋 Все заказы (Excel)", callback_data="export_orders")
-    kb.adjust(1)
-    return kb.as_markup()
+    kb = InlineKeyboardMarkup()
+    kb.add(InlineKeyboardButton("➕ Добавить меню", callback_data="add_menu"))
+    kb.add(InlineKeyboardButton("📋 Все заказы (Excel)", callback_data="export_orders"))
+    return kb
 
 
 def menu_keyboard(menu_items):
-    kb = InlineKeyboardBuilder()
+    kb = InlineKeyboardMarkup()
     for item in menu_items:
-        kb.button(text=item, callback_data=f"order:{item}")
-    kb.adjust(1)
-    return kb.as_markup()
+        kb.add(InlineKeyboardButton(item, callback_data=f"order:{item}"))
+    return kb
 
 
 # ---------------------- КОМАНДЫ ----------------------
 
-@dp.message(Command("start"))
-async def start_cmd(message: Message):
+@dp.message_handler(commands=["start"])
+async def start_cmd(message: types.Message):
     conn = await db_connect()
 
     await conn.execute("""
@@ -100,14 +97,14 @@ async def start_cmd(message: Message):
         await message.answer("Привет! Я бот для заказа обедов.\nЖди меню от администратора.")
 
 
-@dp.callback_query(F.data == "add_menu")
-async def add_menu_handler(callback: CallbackQuery):
+@dp.callback_query_handler(lambda c: c.data == "add_menu")
+async def add_menu_handler(callback: types.CallbackQuery):
     await callback.message.answer("Отправь меню списком, каждое блюдо с новой строки.")
-    dp.message.register(save_menu)
+    dp.register_message_handler(save_menu)
     await callback.answer()
 
 
-async def save_menu(message: Message):
+async def save_menu(message: types.Message):
     items = message.text.split("\n")
     conn = await db_connect()
 
@@ -119,11 +116,11 @@ async def save_menu(message: Message):
     await conn.close()
 
     await message.answer("Меню сохранено!")
-    dp.message.unregister(save_menu)
+    dp.unregister_message_handler(save_menu)
 
 
-@dp.callback_query(F.data.startswith("order:"))
-async def order_handler(callback: CallbackQuery):
+@dp.callback_query_handler(lambda c: c.data.startswith("order:"))
+async def order_handler(callback: types.CallbackQuery):
     item = callback.data.split(":", 1)[1]
 
     conn = await db_connect()
@@ -137,8 +134,8 @@ async def order_handler(callback: CallbackQuery):
     await callback.answer()
 
 
-@dp.callback_query(F.data == "export_orders")
-async def export_orders(callback: CallbackQuery):
+@dp.callback_query_handler(lambda c: c.data == "export_orders")
+async def export_orders(callback: types.CallbackQuery):
     conn = await db_connect()
     rows = await conn.fetch("""
         SELECT u.name, o.item, o.comment
@@ -182,15 +179,13 @@ async def send_reminders():
 
 # ---------------------- ЗАПУСК ----------------------
 
-async def main():
+async def on_startup(_):
     await init_db()
 
     scheduler = AsyncIOScheduler()
     scheduler.add_job(send_reminders, "cron", hour=11, minute=0)
     scheduler.start()
 
-    await dp.start_polling(bot)
-
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    executor.start_polling(dp, on_startup=on_startup)
