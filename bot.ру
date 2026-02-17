@@ -1,0 +1,189 @@
+import asyncio
+import logging
+from aiogram import Bot, Dispatcher, F
+from aiogram.types import Message, CallbackQuery
+from aiogram.filters import Command
+from aiogram.utils.keyboard import InlineKeyboardBuilder
+import asyncpg
+import pandas as pd
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from datetime import datetime
+from dotenv import load_dotenv
+import os
+
+load_dotenv()
+
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+DB_DSN = os.getenv("DB_DSN")
+ADMIN_IDS = list(map(int, os.getenv("ADMIN_IDS", "").split(",")))
+
+logging.basicConfig(level=logging.INFO)
+
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher()
+
+
+# ---------------------- БАЗА ДАННЫХ ----------------------
+
+async def db_connect():
+    return await asyncpg.connect(DB_DSN)
+
+
+async def init_db():
+    conn = await db_connect()
+    await conn.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            id SERIAL PRIMARY KEY,
+            tg_id BIGINT UNIQUE,
+            name TEXT,
+            is_admin BOOLEAN DEFAULT FALSE
+        );
+    """)
+
+    await conn.execute("""
+        CREATE TABLE IF NOT EXISTS menu (
+            id SERIAL PRIMARY KEY,
+            date DATE,
+            item TEXT
+        );
+    """)
+
+    await conn.execute("""
+        CREATE TABLE IF NOT EXISTS orders (
+            id SERIAL PRIMARY KEY,
+            user_id BIGINT,
+            date DATE,
+            item TEXT,
+            comment TEXT
+        );
+    """)
+
+    await conn.close()
+
+
+# ---------------------- КНОПКИ ----------------------
+
+def admin_keyboard():
+    kb = InlineKeyboardBuilder()
+    kb.button(text="➕ Добавить меню", callback_data="add_menu")
+    kb.button(text="📋 Все заказы (Excel)", callback_data="export_orders")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+def menu_keyboard(menu_items):
+    kb = InlineKeyboardBuilder()
+    for item in menu_items:
+        kb.button(text=item, callback_data=f"order:{item}")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+# ---------------------- КОМАНДЫ ----------------------
+
+@dp.message(Command("start"))
+async def start_cmd(message: Message):
+    conn = await db_connect()
+
+    await conn.execute("""
+        INSERT INTO users (tg_id, name, is_admin)
+        VALUES ($1, $2, $3)
+        ON CONFLICT (tg_id) DO NOTHING
+    """, message.from_user.id, message.from_user.full_name, message.from_user.id in ADMIN_IDS)
+
+    await conn.close()
+
+    if message.from_user.id in ADMIN_IDS:
+        await message.answer("Привет, админ!", reply_markup=admin_keyboard())
+    else:
+        await message.answer("Привет! Я бот для заказа обедов.\nЖди меню от администратора.")
+
+
+@dp.callback_query(F.data == "add_menu")
+async def add_menu_handler(callback: CallbackQuery):
+    await callback.message.answer("Отправь меню списком, каждое блюдо с новой строки.")
+    dp.message.register(save_menu)
+    await callback.answer()
+
+
+async def save_menu(message: Message):
+    items = message.text.split("\n")
+    conn = await db_connect()
+
+    await conn.execute("DELETE FROM menu WHERE date = $1", datetime.now().date())
+
+    for item in items:
+        await conn.execute("INSERT INTO menu (date, item) VALUES ($1, $2)", datetime.now().date(), item)
+
+    await conn.close()
+
+    await message.answer("Меню сохранено!")
+    dp.message.unregister(save_menu)
+
+
+@dp.callback_query(F.data.startswith("order:"))
+async def order_handler(callback: CallbackQuery):
+    item = callback.data.split(":", 1)[1]
+
+    conn = await db_connect()
+    await conn.execute("""
+        INSERT INTO orders (user_id, date, item)
+        VALUES ($1, $2, $3)
+    """, callback.from_user.id, datetime.now().date(), item)
+    await conn.close()
+
+    await callback.message.answer(f"Вы выбрали: {item}")
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "export_orders")
+async def export_orders(callback: CallbackQuery):
+    conn = await db_connect()
+    rows = await conn.fetch("""
+        SELECT u.name, o.item, o.comment
+        FROM orders o
+        JOIN users u ON u.tg_id = o.user_id
+        WHERE o.date = $1
+    """, datetime.now().date())
+    await conn.close()
+
+    if not rows:
+        await callback.message.answer("Сегодня заказов нет.")
+        return
+
+    df = pd.DataFrame(rows, columns=["Имя", "Блюдо", "Комментарий"])
+    file_path = "orders.xlsx"
+    df.to_excel(file_path, index=False)
+
+    await callback.message.answer_document(open(file_path, "rb"))
+
+
+# ---------------------- НАПОМИНАНИЕ ----------------------
+
+async def send_reminders():
+    conn = await db_connect()
+    users = await conn.fetch("SELECT tg_id FROM users WHERE is_admin = FALSE")
+    menu = await conn.fetch("SELECT item FROM menu WHERE date = $1", datetime.now().date())
+    await conn.close()
+
+    if not menu:
+        return
+
+    for user in users:
+        await bot.send_message(user["tg_id"], "Не забудь выбрать обед!")
+
+
+# ---------------------- ЗАПУСК ----------------------
+
+async def main():
+    await init_db()
+
+    scheduler = AsyncIOScheduler()
+    scheduler.add_job(send_reminders, "cron", hour=11, minute=0)
+    scheduler.start()
+
+    await dp.start_polling(bot)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
