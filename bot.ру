@@ -5,7 +5,7 @@ from aiogram.types import Message, CallbackQuery
 from aiogram.filters import Command
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 import asyncpg
-import pandas as pd
+from openpyxl import Workbook
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from datetime import datetime
 from dotenv import load_dotenv
@@ -31,6 +31,7 @@ async def db_connect():
 
 async def init_db():
     conn = await db_connect()
+
     await conn.execute("""
         CREATE TABLE IF NOT EXISTS users (
             id SERIAL PRIMARY KEY,
@@ -151,9 +152,15 @@ async def export_orders(callback: CallbackQuery):
         await callback.message.answer("Сегодня заказов нет.")
         return
 
-    df = pd.DataFrame(rows, columns=["Имя", "Блюдо", "Комментарий"])
+    wb = Workbook()
+    ws = wb.active
+    ws.append(["Имя", "Блюдо", "Комментарий"])
+
+    for row in rows:
+        ws.append([row["name"], row["item"], row["comment"]])
+
     file_path = "orders.xlsx"
-    df.to_excel(file_path, index=False)
+    wb.save(file_path)
 
     await callback.message.answer_document(open(file_path, "rb"))
 
